@@ -1,0 +1,16 @@
+zenml[local]
+zenml[sklearn]
+zenml[mlflow]
+zenml[evidently]
+zenml[aws]
+zenml[s3]
+zenml[server]
+mlflow
+optuna
+pandas
+numpy
+scikit-learn
+xgboost
+lightgbm
+catboost
+pyarrow
