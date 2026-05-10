@@ -10,13 +10,18 @@ from catboost import CatBoostRegressor
 from lightgbm import LGBMRegressor
 from sklearn.base import clone
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import RidgeCV
 from sklearn.model_selection import KFold
+from src.mlflow_diagnostics import print_mlflow_context
 from xgboost import XGBRegressor
 from zenml import step
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-BEST_PARAMS_PATH = PROJECT_ROOT / "tuning_results" / "best_params.json"
+BEST_PARAMS_PATH = PROJECT_ROOT / "tuning_results" / "best_params_99acres.json"
+
+
+def _merge_params(defaults: Dict[str, Any], tuned: Dict[str, Any]) -> Dict[str, Any]:
+    return {**defaults, **tuned}
 
 
 @step(experiment_tracker="mlflow_tracker")
@@ -39,6 +44,7 @@ def model_training_and_stacking(
         A dictionary of trained base models and the trained meta-model.
     """
     print("Starting model training and stacking with OOF...")
+    print_mlflow_context("model_training_and_stacking")
 
     if X_train.empty:
         raise ValueError("X_train is empty.")
@@ -50,11 +56,24 @@ def model_training_and_stacking(
         with open(BEST_PARAMS_PATH, "r") as f:
             tuned_params = json.load(f)
 
+    xgboost_params = _merge_params(
+        {"random_state": 42, "n_jobs": -1},
+        tuned_params.get("xgboost", {}),
+    )
+    lightgbm_params = _merge_params(
+        {"random_state": 42, "n_jobs": -1, "verbose": -1},
+        tuned_params.get("lightgbm", {}),
+    )
+    catboost_params = _merge_params(
+        {"random_seed": 42, "verbose": 0, "allow_writing_files": False},
+        tuned_params.get("catboost", {}),
+    )
+
     base_models = {
         "RandomForest": RandomForestRegressor(random_state=42, n_jobs=-1),
-        "XGBoost": XGBRegressor(**tuned_params.get("xgboost", {"random_state": 42, "n_jobs": -1})),
-        "LightGBM": LGBMRegressor(**tuned_params.get("lightgbm", {"random_state": 42, "n_jobs": -1, "verbose": -1})),
-        "CatBoost": CatBoostRegressor(**tuned_params.get("catboost", {"random_seed": 42, "verbose": 0})),
+        "XGBoost": XGBRegressor(**xgboost_params),
+        "LightGBM": LGBMRegressor(**lightgbm_params),
+        "CatBoost": CatBoostRegressor(**catboost_params),
     }
 
     # Initialize KFold for OOF predictions
@@ -80,8 +99,8 @@ def model_training_and_stacking(
         meta_features[f"{name}_pred"] = oof_preds
 
     # Train the meta-model on OOF predictions
-    print("Training meta-model on OOF features...")
-    meta_model = LinearRegression()
+    print("Training meta-model (RidgeCV) on OOF features...")
+    meta_model = RidgeCV(alphas=np.logspace(-2, 2, 9))
     meta_model.fit(meta_features, y_train)
     
     # Log meta-model to MLflow

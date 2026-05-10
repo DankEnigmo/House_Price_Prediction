@@ -1,3 +1,4 @@
+import re
 from typing import Annotated, Any, Tuple
 
 import numpy as np
@@ -11,12 +12,20 @@ from zenml import step
 
 
 TARGET_COLUMN = "Price_in_Lakhs"
-LEAKAGE_COLUMNS = ["ID", "Price_per_SqFt"]
+LEAKAGE_COLUMNS = [
+    "PRICE",
+    "MIN_PRICE",
+    "MAX_PRICE",
+    "PRICE_SQFT",
+    "PRICE_PER_UNIT_AREA",
+]
+IDENTIFIER_COLUMNS = ["Prop_ID", "Source_File"]
 AMENITIES_COLUMN = "Amenities"
 TEST_SIZE = 0.2
 RANDOM_STATE = 42
 HIGH_CARDINALITY_THRESHOLD = 50
 TARGET_ENCODING_SMOOTHING = 10
+TARGET_ENCODE_CANDIDATES = ["Locality", "Society_Name", "Building_Name"]
 
 
 def _make_one_hot_encoder() -> OneHotEncoder:
@@ -43,13 +52,10 @@ class HousingFeaturePreprocessor:
         self.global_mean_ = data[TARGET_COLUMN].mean()
         
         features = self._prepare_features(data, fit=True)
-        categorical_candidates = features.select_dtypes(
-            include=["object", "category", "string"]
-        ).columns.tolist()
-        
         self.high_cardinality_columns_ = [
             column
-            for column in categorical_candidates
+            for column in TARGET_ENCODE_CANDIDATES
+            if column in features.columns
             if features[column].nunique(dropna=True) > HIGH_CARDINALITY_THRESHOLD
         ]
         
@@ -113,6 +119,9 @@ class HousingFeaturePreprocessor:
         return pd.DataFrame(transformed, columns=self.column_transformer_.get_feature_names_out(), index=data.index)
 
     def transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        if self.column_transformer_ is None:
+            raise RuntimeError("HousingFeaturePreprocessor must be fitted before transform.")
+
         features = self._prepare_features(data, fit=False)
         
         # Apply pre-learned maps (Inference mode)
@@ -125,14 +134,24 @@ class HousingFeaturePreprocessor:
         return pd.DataFrame(transformed, columns=self.column_transformer_.get_feature_names_out(), index=data.index)
 
     def _prepare_features(self, data: pd.DataFrame, fit: bool) -> pd.DataFrame:
-        features = data.drop(columns=[TARGET_COLUMN, *LEAKAGE_COLUMNS], errors="ignore").copy()
+        features = data.drop(
+            columns=[TARGET_COLUMN, *LEAKAGE_COLUMNS, *IDENTIFIER_COLUMNS],
+            errors="ignore",
+        ).copy()
 
-        # Strip whitespace and log-transform size
+        # Strip whitespace and log-transform area.
         for col in features.select_dtypes(include=["object", "string"]).columns:
-            features[col] = features[col].astype(str).str.strip()
+            features[col] = features[col].astype("string").str.strip()
+            features[col] = features[col].replace(
+                {"": pd.NA, "nan": pd.NA, "None": pd.NA, "<NA>": pd.NA}
+            )
+            features[col] = features[col].astype(object).fillna(np.nan)
 
-        if "Size_in_SqFt" in features.columns:
-            features["Size_in_SqFt"] = np.log1p(features["Size_in_SqFt"])
+        if "Area_SqFt" in features.columns and "BHK" in features.columns:
+            features["price_per_sqft_estimated"] = features["Area_SqFt"] / features["BHK"].replace(0, np.nan)
+
+        if "Area_SqFt" in features.columns:
+            features["Area_SqFt"] = np.log1p(features["Area_SqFt"])
 
         if AMENITIES_COLUMN in features.columns:
             amenities = features[AMENITIES_COLUMN].fillna("").astype(str)
@@ -143,14 +162,18 @@ class HousingFeaturePreprocessor:
                 self.amenity_values_ = sorted(values)
 
             for amenity in self.amenity_values_:
-                features[f"amenity_{amenity.lower().replace(' ', '_')}"] = amenities.apply(
+                column_name = f"amenity_{_safe_feature_name(amenity)}"
+                features[column_name] = amenities.apply(
                     lambda v, exp=amenity: int(exp in {i.strip() for i in v.split(",")})
                 )
             features = features.drop(columns=[AMENITIES_COLUMN])
 
-        for column in features.select_dtypes(include=["object", "category"]).columns:
-            features[column] = features[column].astype("string")
         return features
+
+
+def _safe_feature_name(value: str) -> str:
+    name = re.sub(r"[^0-9a-zA-Z]+", "_", value.strip().lower())
+    return re.sub(r"_+", "_", name).strip("_")
 
 
 @step
@@ -182,6 +205,11 @@ def feature_engineering(
     preprocessor = HousingFeaturePreprocessor()
     X_train = preprocessor.fit_transform_kfold(train_raw)
     X_test = preprocessor.transform(X_test_raw)
+
+    column_match = list(X_train.columns) == list(X_test.columns)
+    print(f"Train/test column match: {column_match}")
+    if not column_match:
+        raise ValueError("Feature engineering produced mismatched train/test columns.")
 
     print(f"Feature engineering complete. X_train shape: {X_train.shape}")
     return X_train, X_test, y_train, y_test, preprocessor

@@ -11,13 +11,16 @@ from lightgbm import LGBMRegressor
 from optuna.pruners import SuccessiveHalvingPruner
 from optuna.samplers import TPESampler
 from sklearn.model_selection import KFold
+from src.mlflow_diagnostics import print_mlflow_context
 from xgboost import XGBRegressor
 from zenml import step
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 TUNING_RESULTS_DIR = PROJECT_ROOT / "tuning_results"
-BEST_PARAMS_PATH = TUNING_RESULTS_DIR / "best_params.json"
-DB_PATH = f"sqlite:///{TUNING_RESULTS_DIR}/optuna.db"
+BEST_PARAMS_PATH = TUNING_RESULTS_DIR / "best_params_99acres.json"
+DB_PATH = f"sqlite:///{TUNING_RESULTS_DIR}/optuna_99acres.db"
+MAX_TUNING_ROWS = 50_000
+N_TRIALS = 50
 
 
 @step(experiment_tracker="mlflow_tracker")
@@ -29,14 +32,17 @@ def hp_tuning_step(
     Hyperparameter tuning step using Optuna with Successive Halving and Adaptive Sampling.
     """
     os.makedirs(TUNING_RESULTS_DIR, exist_ok=True)
+    print_mlflow_context("hp_tuning_step")
 
-    # Subset data for more intense tuning (e.g., 100k rows)
-    if len(X_train) > 100000:
-        X_tune = X_train.tail(100000)
-        y_tune = y_train.tail(100000)
+    if len(X_train) > MAX_TUNING_ROWS:
+        X_tune = X_train.sample(MAX_TUNING_ROWS, random_state=42)
+        y_tune = y_train.loc[X_tune.index]
     else:
         X_tune = X_train
         y_tune = y_train
+
+    print(f"Optuna tuning rows: {len(X_tune)}")
+    print(f"Optuna trials per model: {N_TRIALS}")
 
     def objective(trial, model_name):
         if model_name == "xgboost":
@@ -50,6 +56,7 @@ def hp_tuning_step(
                 "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
                 "random_state": 42,
                 "n_jobs": -1,
+                "early_stopping_rounds": 50,
             }
             model_class = XGBRegressor
         elif model_name == "lightgbm":
@@ -63,7 +70,6 @@ def hp_tuning_step(
                 "subsample": trial.suggest_float("subsample", 0.6, 1.0),
                 "random_state": 42,
                 "n_jobs": -1,
-                "verbose": -1,
             }
             model_class = LGBMRegressor
         elif model_name == "catboost":
@@ -76,6 +82,7 @@ def hp_tuning_step(
                 "l2_leaf_reg": trial.suggest_float("l2_leaf_reg", 1, 10),
                 "random_seed": 42,
                 "verbose": 0,
+                "allow_writing_files": False,
             }
             model_class = CatBoostRegressor
 
@@ -88,14 +95,13 @@ def hp_tuning_step(
 
             model = model_class(**params)
 
+            fit_params = {"eval_set": [(X_fold_val, y_fold_val)]}
             if model_name == "xgboost":
-                model.fit(X_fold_train, y_fold_train)
-            else:
-                model.fit(
-                    X_fold_train,
-                    y_fold_train,
-                    eval_set=[(X_fold_val, y_fold_val)],
-                )
+                fit_params["verbose"] = False
+            elif model_name == "catboost":
+                fit_params["verbose"] = 0
+
+            model.fit(X_fold_train, y_fold_train, **fit_params)
 
             y_pred = model.predict(X_fold_val)
             rmse = np.sqrt(np.mean((y_fold_val - y_pred) ** 2))
@@ -115,11 +121,15 @@ def hp_tuning_step(
             study_name=f"{model_name}_tuning",
             storage=DB_PATH,
             direction="minimize",
-            sampler=TPESampler(),
+            sampler=TPESampler(multivariate=True, seed=42),
             pruner=SuccessiveHalvingPruner(),
             load_if_exists=True,
         )
-        study.optimize(lambda trial: objective(trial, model_name), n_trials=100)
+        study.optimize(
+            lambda trial: objective(trial, model_name), 
+            n_trials=N_TRIALS, 
+            n_jobs=4
+        )
         best_params[model_name] = study.best_params
         print(f"Best params for {model_name}: {study.best_params}")
 

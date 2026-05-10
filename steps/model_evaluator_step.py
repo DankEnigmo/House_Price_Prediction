@@ -4,6 +4,7 @@ import mlflow
 import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from src.mlflow_diagnostics import print_mlflow_context
 from zenml import step
 
 
@@ -27,6 +28,7 @@ def model_evaluator(
         A dictionary containing RMSE, MAE, and R2 metrics on the original scale.
     """
     print("Starting model evaluation on original scale with MLflow logging...")
+    print_mlflow_context("model_evaluator")
 
     if X_test.empty:
         print("Test data is empty, skipping evaluation.")
@@ -35,6 +37,29 @@ def model_evaluator(
     # Convert y_test back to original scale (Lakhs)
     y_test_orig = np.expm1(y_test)
     metrics = {}
+    mlflow.log_metric("dataset_test_rows", len(X_test))
+    mlflow.log_metric("dataset_feature_count", X_test.shape[1])
+
+    mean_pred = np.repeat(y_test_orig.mean(), len(y_test_orig))
+    log_mean_pred = np.repeat(np.expm1(y_test.mean()), len(y_test_orig))
+    baseline_specs = {
+        "mean_baseline": mean_pred,
+        "log_mean_baseline": log_mean_pred,
+    }
+    for baseline_name, baseline_pred in baseline_specs.items():
+        rmse = mean_squared_error(y_test_orig, baseline_pred) ** 0.5
+        mae = mean_absolute_error(y_test_orig, baseline_pred)
+        r2 = r2_score(y_test_orig, baseline_pred)
+        metrics[f"{baseline_name}_rmse"] = rmse
+        metrics[f"{baseline_name}_mae"] = mae
+        metrics[f"{baseline_name}_r2"] = r2
+        mlflow.log_metric(f"{baseline_name}_rmse", rmse)
+        mlflow.log_metric(f"{baseline_name}_mae", mae)
+        mlflow.log_metric(f"{baseline_name}_r2", r2)
+        print(
+            f"{baseline_name} - RMSE: {rmse:.4f}, "
+            f"MAE: {mae:.4f}, R2: {r2:.4f}"
+        )
 
     for name, model in trained_base_models.items():
         y_pred_log = model.predict(X_test)
@@ -82,6 +107,17 @@ def model_evaluator(
         f"Ensemble Model - RMSE: {ensemble_rmse:.4f}, "
         f"MAE: {ensemble_mae:.4f}, R2: {ensemble_r2:.4f}"
     )
+
+    rmse_metrics = {
+        key.removesuffix("_rmse"): value
+        for key, value in metrics.items()
+        if key.endswith("_rmse")
+    }
+    best_model_name = min(rmse_metrics, key=rmse_metrics.get)
+    metrics["best_model_rmse"] = rmse_metrics[best_model_name]
+    mlflow.log_metric("best_model_rmse", rmse_metrics[best_model_name])
+    mlflow.set_tag("best_model_by_rmse", best_model_name)
+    print(f"Best model by RMSE: {best_model_name} ({rmse_metrics[best_model_name]:.4f})")
 
     print("Model evaluation complete. Metrics logged to MLflow.")
     return metrics
